@@ -1,8 +1,12 @@
+## Achieved 7th place among 31 teams with a 5-fold ensemble using DeepLab v3 and ResNet-50 (score: 0.02278).
+
 import os
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
 from PIL import Image
+
+from sklearn.model_selection import KFold
 
 import torch
 import torch.nn as nn
@@ -38,8 +42,7 @@ class LULCDataset(Dataset):
         return image, label
 
 
-# ===== Label Smoothing =====
-# 2024.10.16 1st rank with the use of DeepLab-v3 & ResNet-101
+# define label smoothing loss
 class LabelSmoothingLoss(nn.Module):
     def __init__(self, classes, smoothing=0.1):
         super(LabelSmoothingLoss, self).__init__()
@@ -52,88 +55,148 @@ class LabelSmoothingLoss(nn.Module):
             true_dist = torch.zeros_like(pred)
             true_dist.fill_(self.smoothing / (self.classes - 1))
             true_dist.scatter_(1, target.unsqueeze(1), 1 - self.smoothing)
+
         return torch.mean(torch.sum(-true_dist * pred, dim=1))
 
 
-def label_smoothing_training(data_loader, num_classes, num_epochs=500, learning_rate=1e-4):
-    print("[Start] Label Smoothing")
-    model = deeplabv3_resnet101(weights=DeepLabV3_ResNet101_Weights.DEFAULT)
-    # model = deeplabv3_resnet50(weights=DeepLabV3_ResNet50_Weights.DEFAULT)
-    model.classifier[4] = nn.Conv2d(256, num_classes, kernel_size=1)
-    model = model.cuda()
+# define train model
+def train_and_evaluate_model(model_type, dataset, num_classes, n_splits=5, num_epochs=300, learning_rate=1e-4):
+    print(f"\nTraining with {model_type}")
 
-    optimizer = Adam(model.parameters(), lr=learning_rate)
-    criterion = LabelSmoothingLoss(classes=num_classes, smoothing=0.1)
+    kfold = KFold(n_splits=n_splits, shuffle=True, random_state=42)
+    fold_results = []
+    all_smooth_scores = []
 
-    model.train()
-    for epoch in range(num_epochs):
-        running_loss = 0.0
-        for images, labels in tqdm(data_loader, desc=f"Label Smoothing Epoch {epoch+1}/{num_epochs}"):
-            images = images.cuda()
-            labels = labels.cuda()
+    for fold, (train_idx, val_idx) in enumerate(kfold.split(dataset)):
+        print(f"\nTraining Fold {fold + 1}/{n_splits}")
 
-            optimizer.zero_grad()
-            outputs = model(images)['out']
-            loss = criterion(outputs, labels)
-            loss.backward()
-            optimizer.step()
+        # set model
+        if model_type == 'resnet50':
+            model = deeplabv3_resnet50(weights=DeepLabV3_ResNet50_Weights.DEFAULT)
+        elif model_type == 'resnet101':
+            model = deeplabv3_resnet101(weights=DeepLabV3_ResNet101_Weights.DEFAULT)
+        else:
+            raise ValueError(f"Model type {model_type} not supported")
 
-            running_loss += loss.item()
-        print(f"Epoch [{epoch+1}/{num_epochs}], Loss: {running_loss/len(data_loader)}")
+        model.classifier[4] = nn.Conv2d(256, num_classes, kernel_size=1)
+        model = model.cuda()
 
-    model.eval()
-    smooth_scores = []
-    with torch.no_grad():
-        for images, labels in tqdm(data_loader, desc="Label Smoothing Evaluation"):
-            images = images.cuda()
-            labels = labels.cuda()
+        optimizer = Adam(model.parameters(), lr=learning_rate)
+        criterion = LabelSmoothingLoss(classes=num_classes, smoothing=0.1)
 
-            outputs = model(images)['out']
-            preds = F.softmax(outputs, dim=1)
+        # set dataset
+        train_sampler = torch.utils.data.SubsetRandomSampler(train_idx)
+        train_loader = DataLoader(dataset, batch_size=8, sampler=train_sampler)
 
-            with torch.no_grad():
+        # execute training
+        model.train()
+        for epoch in range(num_epochs):
+            running_loss = 0.0
+            for images, labels in tqdm(train_loader, desc=f"Epoch {epoch + 1}/{num_epochs}"):
+                images = images.cuda()
+                labels = labels.cuda()
+
+                optimizer.zero_grad()
+                outputs = model(images)['out']
+                loss = criterion(outputs, labels)
+                loss.backward()
+                optimizer.step()
+
+                running_loss += loss.item()
+            print(f"Epoch [{epoch + 1}/{num_epochs}], Loss: {running_loss / len(train_loader)}")
+
+        full_loader = DataLoader(dataset, batch_size=8, shuffle=False)
+        model.eval()
+        fold_scores = []
+        with torch.no_grad():
+            for images, labels in tqdm(full_loader, desc=f"Evaluating Fold {fold + 1}"):
+                images = images.cuda()
+                labels = labels.cuda()
+
+                outputs = model(images)['out']
+                preds = F.softmax(outputs, dim=1)
+
                 true_dist = torch.zeros_like(preds)
                 true_dist.fill_(0.1 / (num_classes - 1))
                 true_dist.scatter_(1, labels.unsqueeze(1), 0.9)
 
-            smooth_diff = torch.abs(preds - true_dist).mean(dim=(1,2,3)).cpu().numpy()
-            smooth_scores.extend(smooth_diff)
+                smooth_diff = torch.abs(preds - true_dist).mean(dim=(1, 2, 3)).cpu().numpy()
+                fold_scores.extend(smooth_diff)
 
-    print("[Complete] Label Smoothing")
+        # save result from current fold
+        sorted_indices = np.argsort(fold_scores)
+        sorted_filenames = [dataset.image_files[i] for i in sorted_indices]
 
-    return smooth_scores
+        fold_results.append({
+            'scores': fold_scores,
+            'sorted_files': sorted_filenames
+        })
+        all_smooth_scores.append(fold_scores)
 
+        fold_submission = pd.DataFrame({
+            "id": range(len(sorted_filenames)),
+            "imageid": sorted_filenames
+        })
+        fold_submission.to_csv(f'submission_{model_type}_fold_{fold + 1}.csv', index=False)
 
-def save_label_smoothing_results(data_loader, dataset, num_classes, num_epochs, out_path):
-    smooth_scores = label_smoothing_training(data_loader, num_classes, num_epochs=num_epochs)
-    sorted_indices = np.argsort(smooth_scores)
+    # save ensemble result
+    ensemble_scores = np.mean(all_smooth_scores, axis=0)
+    sorted_indices = np.argsort(ensemble_scores)
     sorted_filenames = [dataset.image_files[i] for i in sorted_indices]
 
-    output = pd.DataFrame({
+    ensemble_submission = pd.DataFrame({
         "id": range(len(sorted_filenames)),
         "imageid": sorted_filenames
     })
-    output.to_csv(os.path.join(out_path, 'rank_label_smoothing.csv'), index=False)
+    ensemble_submission.to_csv(f'submission_{model_type}_ensemble.csv', index=False)
+
+    return fold_results, ensemble_submission
 
 
-def main(image_path, label_path, out_path, transform, num_classes, num_epochs=300):
+def main(image_path, label_path, transform, num_classes, num_epochs=300):
     dataset = LULCDataset(image_path, label_path, transform=transform)
-    data_loader = DataLoader(dataset, batch_size=8, shuffle=True)
 
-    save_label_smoothing_results(data_loader, dataset, num_classes, num_epochs=num_epochs, out_path=out_path)
+    # get result from ResNet-50
+    resnet50_results, resnet50_ensemble = train_and_evaluate_model(
+        'resnet50', dataset, num_classes, n_splits=5, num_epochs=num_epochs
+    )
+
+    # get result from ResNet-101
+    resnet101_results, resnet101_ensemble = train_and_evaluate_model(
+        'resnet101', dataset, num_classes, n_splits=5, num_epochs=num_epochs
+    )
+
+    # get ensemble from ResNet-50 & ResNet-101
+    final_ensemble = pd.merge(
+        resnet50_ensemble.rename(columns={'imageid': 'r50_imageid'}),
+        resnet101_ensemble.rename(columns={'imageid': 'r101_imageid'}),
+        on='id'
+    )
+
+    final_filenames = []
+    for _, row in final_ensemble.iterrows():
+        r50_idx = list(dataset.image_files).index(row['r50_imageid'])
+        r101_idx = list(dataset.image_files).index(row['r101_imageid'])
+        final_filenames.append((row['r50_imageid'], (r50_idx + r101_idx) / 2))
+
+    final_filenames.sort(key=lambda x: x[1])
+    final_submission = pd.DataFrame({
+        "id": range(len(final_filenames)),
+        "imageid": [f[0] for f in final_filenames]
+    })
+    final_submission.to_csv('submission_final_ensemble.csv', index=False)
 
 
-# execute code
 if __name__ == '__main__':
     image_dir = r"C:\pr03_lulc\images"
     label_dir = r"C:\pr03_lulc\labels"
-    out_dir = r"C:\pr03_lulc\output"
-    os.makedirs(out_dir, exist_ok=True)
+
     transform = transforms.Compose([
         transforms.Resize((256, 256)),
         transforms.ToTensor()
     ])
+
     num_classes = 2
     num_epochs = 300
 
-    main(image_dir, label_dir, out_dir, transform, num_classes, num_epochs)
+    main(image_dir, label_dir, transform, num_classes, num_epochs)
